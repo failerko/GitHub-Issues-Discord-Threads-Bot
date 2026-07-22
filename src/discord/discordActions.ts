@@ -17,11 +17,26 @@ import {
 import { store } from "../store";
 import client from "./discord";
 
+// Discord allows 20 tags per forum and 5 per thread. Every source below
+// competes for both, so each gets a hard allocation and overflow is skipped
+// with a warning rather than pushing setAvailableTags past the limit and
+// failing the entire sync.
 const TAG_BUDGET = {
-  total: 20, // Discord hard limit
-  opinionated: 12, // Max opinionated tags
-  kanban: 8, // Max kanban column tags (20 - opinionated)
+  total: 20, // Discord hard limit per forum
+  perThread: 5, // Discord hard limit per thread
+  types: 3, // Bug / Feature / Task, from GitHub native issue types
+  status: 8, // Project Status column tags
+  priority: 4, // Project Priority column tags
+  labels: 5, // GitHub repo label tags
 };
+
+// Labels matching this are milestone markers (M2, M3, ...). They multiply
+// without bound, so they are never mirrored as Discord tags.
+const MILESTONE_LABEL_PATTERN = /^M\d+$/;
+
+export function isMilestoneLabel(name: string): boolean {
+  return MILESTONE_LABEL_PATTERN.test(name);
+}
 
 interface OpinionatedTag {
   name: string;
@@ -31,8 +46,11 @@ interface OpinionatedTag {
   isType?: boolean; // true = synced via GitHub native issue types, not labels
 }
 
+// Only issue-type tags are defined here. Everything else that used to live in
+// this list is now mirrored from its source of truth on GitHub: repo labels via
+// syncLabelTags, and Status/Priority via the project board. The bot no longer
+// creates labels on GitHub, so deleting a label there removes its tag here.
 const OPINIONATED_TAGS: OpinionatedTag[] = [
-  // Issue type (colored) — synced via GitHub native issue types, not labels
   {
     name: "Bug",
     emoji: { id: null, name: "\u{1F534}" },
@@ -51,18 +69,6 @@ const OPINIONATED_TAGS: OpinionatedTag[] = [
     color: "0075ca",
     isType: true,
   },
-  // Priority (moderator-only)
-  { name: "Critical", moderated: true },
-  { name: "High Priority", moderated: true },
-  { name: "Low Priority" },
-  // Status (moderator-only)
-  { name: "Needs Triage", moderated: true },
-  { name: "Accepted", moderated: true },
-  { name: "Won't Fix", moderated: true },
-  // Meta
-  { name: "Good First Issue" },
-  { name: "Help Wanted" },
-  { name: "Duplicate", moderated: true },
 ];
 
 /** Set of tag names that map to GitHub native issue types (not labels) */
@@ -658,36 +664,76 @@ export async function resetOpinionatedTags() {
   );
 }
 
-export async function resetOpinionatedLabels() {
-  // Fetch all existing labels
-  const { data: existingLabels } = await octokit.rest.issues.listLabelsForRepo({
+/**
+ * Mirror GitHub repo labels as Discord forum tags. GitHub is the source of
+ * truth: the bot never creates labels there, so a label deleted on GitHub
+ * simply stops being mirrored. Milestone labels are excluded because they grow
+ * without bound and would exhaust the 20-tag forum budget.
+ */
+export async function syncLabelTags() {
+  const labels = await octokit.paginate(octokit.rest.issues.listLabelsForRepo, {
     ...repoCredentials,
     per_page: 100,
   });
 
-  const existingByName = new Map(existingLabels.map((l) => [l.name, l]));
+  const eligible = labels
+    .filter((l) => !isMilestoneLabel(l.name))
+    .filter((l) => !TYPE_TAG_NAMES.has(l.name));
 
-  // Only create labels that don't already exist
-  // Type tags (Bug/Feature/Task) are managed via GitHub native issue types
-  const labelTags = OPINIONATED_TAGS.filter((t) => !t.isType);
-  let createdCount = 0;
-  for (const tag of labelTags) {
-    if (!existingByName.has(tag.name)) {
-      await octokit.rest.issues.createLabel({
-        ...repoCredentials,
-        name: tag.name,
-        ...(tag.color && { color: tag.color }),
-      });
-      createdCount++;
+  const skippedMilestones = labels.length - eligible.length;
+  const withinBudget = eligible.slice(0, TAG_BUDGET.labels);
+
+  if (eligible.length > TAG_BUDGET.labels) {
+    logger.warn(
+      `Label sync: ${eligible.length} labels eligible but only ${TAG_BUDGET.labels} tag slots reserved. ` +
+        `Not mirrored: ${eligible
+          .slice(TAG_BUDGET.labels)
+          .map((l) => l.name)
+          .join(", ")}`,
+    );
+  }
+
+  const forum = (await client.channels.fetch(
+    config.DISCORD_CHANNEL_ID,
+  )) as ForumChannel;
+
+  const existing = forum.availableTags;
+  const newTags = withinBudget
+    .filter((l) => !findTagByName(existing, l.name.slice(0, 20)))
+    .map((l) => ({ name: l.name.slice(0, 20) }));
+
+  if (newTags.length > 0) {
+    const allTags = dedupeTagsByName([...existing, ...newTags]);
+    if (allTags.length > TAG_BUDGET.total) {
+      logger.warn(
+        `Label sync: adding ${newTags.length} label tag(s) would exceed the ${TAG_BUDGET.total}-tag limit (${existing.length} used). Skipped.`,
+      );
+      return;
     }
+    await forum.setAvailableTags(allTags);
+  }
+
+  const refreshed = await forum.fetch();
+  store.availableTags = refreshed.availableTags;
+
+  // Label tags share store.tagMap with the type tags, which is what
+  // handleLabeled/handleUnlabeled already look up.
+  for (const label of withinBudget) {
+    const tag = findTagByName(store.availableTags, label.name.slice(0, 20));
+    if (tag) store.tagMap.set(label.name, tag.id);
   }
 
   logger.info(
-    `Label sync: ${createdCount} new labels created, ${existingLabels.length} existing preserved (${TYPE_TAG_NAMES.size} type tags managed natively)`,
+    `Label sync: ${withinBudget.length} label tags mapped, ${skippedMilestones} milestone label(s) skipped (${store.availableTags.length}/${TAG_BUDGET.total} slots used)`,
   );
 }
 
-export async function syncKanbanTags(columns: ProjectColumn[]) {
+/** Mirror a project single-select field's options as forum tags. */
+export async function syncColumnTags(
+  columns: ProjectColumn[],
+  options: { budget: number; targetMap: Map<string, string>; field: string },
+) {
+  const { budget, targetMap, field } = options;
   const forum = (await client.channels.fetch(
     config.DISCORD_CHANNEL_ID,
   )) as ForumChannel;
@@ -697,12 +743,12 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
     existingTags.map((t) => t.name.toLowerCase()),
   );
 
-  const kanbanSlots = Math.min(columns.length, TAG_BUDGET.kanban);
+  const kanbanSlots = Math.min(columns.length, budget);
   const columnsToSync = columns.slice(0, kanbanSlots);
 
-  if (columns.length > TAG_BUDGET.kanban) {
+  if (columns.length > budget) {
     logger.warn(
-      `Kanban: Project has ${columns.length} status columns but only ${TAG_BUDGET.kanban} reserved tag slots. Only syncing first ${TAG_BUDGET.kanban}.`,
+      `${field}: Project has ${columns.length} options but only ${budget} reserved tag slots. Only syncing first ${budget}.`,
     );
   }
 
@@ -748,7 +794,7 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
   // Check total budget
   if (allTags.length > TAG_BUDGET.total) {
     logger.warn(
-      `Kanban: Cannot create ${newColumnTags.length} kanban tags -- would exceed ${TAG_BUDGET.total}-tag Discord limit (${existingTags.length} already used)`,
+      `${field}: Cannot create ${newColumnTags.length} tags -- would exceed ${TAG_BUDGET.total}-tag Discord limit (${existingTags.length} already used)`,
     );
     return;
   }
@@ -762,52 +808,68 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
   const refreshed = await forum.fetch();
   store.availableTags = refreshed.availableTags;
 
-  // Populate kanbanTagMap
-  store.kanbanTagMap.clear();
+  targetMap.clear();
   for (const col of columnsToSync) {
     const truncated = col.name.slice(0, 20);
     const matchingTag = findTagByName(store.availableTags, truncated);
     if (matchingTag) {
-      store.kanbanTagMap.set(col.name, matchingTag.id);
+      targetMap.set(col.name, matchingTag.id);
     }
   }
 
   logger.info(
-    `Kanban: ${store.kanbanTagMap.size} column tags synced (${store.availableTags.length}/${TAG_BUDGET.total} tag slots used)`,
+    `${field}: ${targetMap.size} column tags synced (${store.availableTags.length}/${TAG_BUDGET.total} tag slots used)`,
   );
+}
+
+export function syncKanbanTags(columns: ProjectColumn[]) {
+  return syncColumnTags(columns, {
+    budget: TAG_BUDGET.status,
+    targetMap: store.kanbanTagMap,
+    field: "Status",
+  });
+}
+
+export function syncPriorityTags(columns: ProjectColumn[]) {
+  return syncColumnTags(columns, {
+    budget: TAG_BUDGET.priority,
+    targetMap: store.priorityTagMap,
+    field: "Priority",
+  });
 }
 
 export async function updateKanbanTag(
   contentNodeId: string,
   oldColumnName: string | undefined,
   newColumnName: string,
+  // Defaults to Status so existing callers are unchanged; Priority passes its
+  // own map so each field replaces only its own tag.
+  tagMap: Map<string, string> = store.kanbanTagMap,
+  field = "Kanban",
 ) {
   const { thread, channel } = await getThreadChannel(contentNodeId);
   if (!thread || !channel) return;
 
-  // Look up old and new tag IDs from kanbanTagMap
-  const oldTagId = oldColumnName
-    ? store.kanbanTagMap.get(oldColumnName)
-    : undefined;
-  const newTagId = store.kanbanTagMap.get(newColumnName);
+  const oldTagId = oldColumnName ? tagMap.get(oldColumnName) : undefined;
+  const newTagId = tagMap.get(newColumnName);
 
   if (!newTagId) {
     logger.warn(
-      `Kanban: No Discord tag found for column "${newColumnName}" -- column may not be synced`,
+      `${field}: No Discord tag found for column "${newColumnName}" -- column may not be synced`,
     );
     return;
   }
 
-  // Build new tags: remove old kanban tag, add new one (never accumulate)
+  // Build new tags: remove this field's old tag, add the new one (never accumulate)
   let newTags = [...thread.appliedTags];
   if (oldTagId) {
     newTags = newTags.filter((t) => t !== oldTagId);
   }
 
   if (!newTags.includes(newTagId)) {
-    if (newTags.length >= 5) {
+    if (newTags.length >= TAG_BUDGET.perThread) {
       logger.warn(
-        `Thread ${thread.title}: Cannot add kanban tag, at 5-tag limit`,
+        `Thread ${thread.title}: Cannot add ${field} tag, at ${TAG_BUDGET.perThread}-tag limit`,
       );
       return;
     }

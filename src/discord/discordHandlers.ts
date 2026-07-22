@@ -11,8 +11,6 @@ import {
 } from "discord.js";
 import { config } from "../config";
 import {
-  addLabelsToIssue,
-  clearIssueType,
   closeIssue,
   createIssue,
   createIssueComment,
@@ -23,8 +21,6 @@ import {
   getIssues,
   lockIssue,
   openIssue,
-  removeLabelFromIssue,
-  setIssueType,
   unlockIssue,
 } from "../github/githubActions";
 import { logger } from "../logger";
@@ -32,10 +28,10 @@ import { store } from "../store";
 import { Thread } from "../interfaces";
 import {
   syncKanbanTags,
+  syncPriorityTags,
+  syncLabelTags,
   resetOpinionatedTags,
-  resetOpinionatedLabels,
   enrichThreadAfterIssueCreation,
-  TYPE_TAG_NAMES,
 } from "./discordActions";
 import {
   registerCommands,
@@ -89,10 +85,10 @@ export async function handleClientReady(client: Client) {
   }
 
   try {
-    await resetOpinionatedLabels();
+    await syncLabelTags();
   } catch (err) {
     logger.error(
-      `Label reset failed during startup: ${err instanceof Error ? err.message : "Unknown error"}`,
+      `Label sync failed during startup: ${err instanceof Error ? err.message : "Unknown error"}`,
     );
   }
 
@@ -111,6 +107,12 @@ export async function handleClientReady(client: Client) {
       store.statusFieldId = project.statusFieldId;
       store.kanbanColumns = project.columns;
       await syncKanbanTags(project.columns);
+
+      store.priorityFieldId = project.priorityFieldId;
+      store.priorityColumns = project.priorityColumns;
+      if (project.priorityColumns.length > 0) {
+        await syncPriorityTags(project.priorityColumns);
+      }
     }
   } catch (err) {
     logger.error(
@@ -159,10 +161,6 @@ export async function handleChannelUpdate(
   }
 }
 
-function arraysEqual(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
-  return a.every((val, idx) => val === b[idx]);
-}
 
 export async function handleThreadUpdate(
   oldThread: AnyThreadChannel,
@@ -175,80 +173,15 @@ export async function handleThreadUpdate(
   if (!thread) return;
 
   // --- Tag change detection ---
-  const oldTags = thread.appliedTags;
+  // Tags mirror GitHub one-way (labels, issue type, Status, Priority), so a tag
+  // edited in Discord is recorded locally and deliberately not pushed back.
+  // Without this the mirror would fight the user: GitHub re-asserts its own
+  // state on the next event and any Discord-side edit is overwritten anyway.
   const currentTags = [...newThread.appliedTags];
+  thread.appliedTags = currentTags;
 
-  if (!thread.lockTagging && !arraysEqual(oldTags, currentTags)) {
-    thread.appliedTags = currentTags; // Update store immediately
-
-    const added = currentTags.filter((t) => !oldTags.includes(t));
-    const removed = oldTags.filter((t) => !currentTags.includes(t));
-
-    // Convert tag IDs to label names using store.tagMap (reverse lookup)
-    // Only opinionated tags have entries in tagMap, so non-opinionated tags are automatically ignored
-    const addedLabels = added
-      .map((id) => {
-        for (const [name, tagId] of store.tagMap.entries()) {
-          if (tagId === id) return name;
-        }
-        return undefined;
-      })
-      .filter((name): name is string => name !== undefined);
-
-    const removedLabels = removed
-      .map((id) => {
-        for (const [name, tagId] of store.tagMap.entries()) {
-          if (tagId === id) return name;
-        }
-        return undefined;
-      })
-      .filter((name): name is string => name !== undefined);
-
-    // Split into type tags (synced via issue types) and non-type tags (synced via labels)
-    const addedTypes = addedLabels.filter((n) => TYPE_TAG_NAMES.has(n));
-    const addedNonTypes = addedLabels.filter((n) => !TYPE_TAG_NAMES.has(n));
-    const removedTypes = removedLabels.filter((n) => TYPE_TAG_NAMES.has(n));
-    const removedNonTypes = removedLabels.filter((n) => !TYPE_TAG_NAMES.has(n));
-
-    // Sync non-type tags as labels (existing behavior)
-    if (addedNonTypes.length > 0) {
-      thread.lockLabeling = true;
-      await addLabelsToIssue(thread, addedNonTypes);
-    }
-    if (removedNonTypes.length > 0) {
-      thread.lockLabeling = true;
-      for (const label of removedNonTypes) {
-        await removeLabelFromIssue(thread, label);
-      }
-    }
-
-    // Sync type tags as GitHub native issue types
-    // When switching types (e.g. Bug→Feature), the user must add the new tag
-    // first then remove the old one (forum requires ≥1 tag). So we may see
-    // removes without adds — only clear the GitHub type if NO type tag remains.
-    for (const typeName of addedTypes) {
-      thread.lockLabeling = true;
-      await setIssueType(thread, typeName);
-    }
-    if (removedTypes.length > 0 && addedTypes.length === 0) {
-      // Check if any type tag is still applied on the thread
-      const hasRemainingType = currentTags.some((tagId) => {
-        for (const [name, id] of store.tagMap.entries()) {
-          if (id === tagId && TYPE_TAG_NAMES.has(name)) return true;
-        }
-        return false;
-      });
-      if (!hasRemainingType) {
-        thread.lockLabeling = true;
-        await clearIssueType(thread);
-      }
-    }
-  }
-
-  // Reset lockTagging if it was set (echo suppression for kanban and label sync)
   if (thread.lockTagging) {
     thread.lockTagging = false;
-    thread.appliedTags = currentTags; // Still update store
   }
 
   if (thread.locked !== locked && !thread.lockLocking) {

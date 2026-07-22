@@ -575,6 +575,8 @@ export async function discoverProject(): Promise<{
   projectTitle: string;
   statusFieldId: string;
   columns: ProjectColumn[];
+  priorityFieldId?: string;
+  priorityColumns: ProjectColumn[];
 } | null> {
   try {
     const result: any = await octokit.graphql(
@@ -663,14 +665,31 @@ export async function discoverProject(): Promise<{
       return null;
     }
 
-    const columns: ProjectColumn[] = statusField.options.map((opt) => ({
-      id: opt.id,
-      name: opt.name,
-      ...(opt.color && { color: opt.color }),
-    }));
+    const toColumns = (
+      options: { id: string; name: string; color?: string }[],
+    ): ProjectColumn[] =>
+      options.map((opt) => ({
+        id: opt.id,
+        name: opt.name,
+        ...(opt.color && { color: opt.color }),
+      }));
+
+    const columns = toColumns(statusField.options);
+
+    // Priority is optional: a board without it simply gets no priority tags.
+    const priorityField = project.fields?.nodes?.find(
+      (f) => f?.name?.toLowerCase() === "priority" && f.options,
+    );
+    const priorityColumns =
+      priorityField?.options && priorityField.id
+        ? toColumns(priorityField.options)
+        : [];
 
     logger.info(
-      `Kanban: Using project "${title}" (#${projectNumber}) with ${columns.length} status columns`,
+      `Kanban: Using project "${title}" (#${projectNumber}) with ${columns.length} status columns` +
+        (priorityColumns.length
+          ? ` and ${priorityColumns.length} priority options`
+          : " (no Priority field)"),
     );
 
     return {
@@ -678,6 +697,8 @@ export async function discoverProject(): Promise<{
       projectTitle: title,
       statusFieldId: statusField.id,
       columns,
+      priorityFieldId: priorityField?.id,
+      priorityColumns,
     };
   } catch (err) {
     if (

@@ -15,6 +15,12 @@ class Store {
   kanbanColumns: ProjectColumn[] = [];
   kanbanTagMap: Map<string, string> = new Map();
 
+  // Project Priority field: mirrored as tags with the same replace-on-change
+  // semantics as Status, so an issue carries at most one priority tag.
+  priorityFieldId?: string;
+  priorityColumns: ProjectColumn[] = [];
+  priorityTagMap: Map<string, string> = new Map();
+
   deleteThread(id: string | undefined) {
     const index = this.threads.findIndex((obj) => obj.id === id);
     if (index !== -1) {

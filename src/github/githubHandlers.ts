@@ -509,9 +509,12 @@ export async function handleProjectItemEdited(req: Request) {
 
   const { field_type, field_name, from, to } = changes.field_value;
 
-  // Guard: only process single_select Status field changes
+  // Guard: only single-select fields we mirror as tags
   if (field_type !== "single_select") return;
-  if (!field_name || field_name.toLowerCase() !== "status") return;
+  if (!field_name) return;
+
+  const fieldKey = field_name.toLowerCase();
+  if (fieldKey !== "status" && fieldKey !== "priority") return;
 
   // Extract content_node_id (the issue's node_id)
   const contentNodeId = req.body.projects_v2_item?.content_node_id;
@@ -524,8 +527,19 @@ export async function handleProjectItemEdited(req: Request) {
   if (!newColumnName) return;
 
   logger.info(
-    `Kanban: Issue moved from "${oldColumnName || "(none)"}" to "${newColumnName}"`,
+    `${field_name}: Issue moved from "${oldColumnName || "(none)"}" to "${newColumnName}"`,
   );
+
+  if (fieldKey === "priority") {
+    await updateKanbanTag(
+      contentNodeId,
+      oldColumnName,
+      newColumnName,
+      store.priorityTagMap,
+      "Priority",
+    );
+    return;
+  }
 
   await updateKanbanTag(contentNodeId, oldColumnName, newColumnName);
 
