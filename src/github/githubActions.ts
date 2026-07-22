@@ -396,19 +396,22 @@ export async function getIssueComments(issueNumber: number) {
 
 export async function getIssues() {
   try {
-    const response = await octokit.rest.issues.listForRepo({
+    // Must paginate: the default page size is 30, so on any repository with
+    // more issues than that the older thread-to-issue links are never loaded
+    // and every handler that looks a thread up in the store silently no-ops.
+    const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
       ...repoCredentials,
       state: "all",
+      per_page: 100,
     });
 
-    if (!response || !response.data) {
-      error("Failed to get issues - No response data");
-      return [];
-    }
+    const threads = formatIssuesToThreads(issues as GitIssue[]);
+    await fillCommentsData(threads);
 
-    await fillCommentsData(); // Wait for comments data to be filled
-
-    return formatIssuesToThreads(response.data as GitIssue[]);
+    logger.info(
+      `Issues: ${issues.length} fetched, ${threads.length} carry a Discord link`,
+    );
+    return threads;
   } catch (err) {
     if (err instanceof Error) {
       error(`Failed to get issues: ${err.message}`);
@@ -419,22 +422,22 @@ export async function getIssues() {
   }
 }
 
-async function fillCommentsData() {
+// Takes the threads explicitly rather than reading store.threads: the caller
+// assigns the store only after getIssues() resolves, so on startup this used to
+// match every comment against an empty array and record nothing.
+async function fillCommentsData(threads: Thread[]) {
   try {
-    const response = await octokit.rest.issues.listCommentsForRepo({
-      ...repoCredentials,
-    });
+    const comments = await octokit.paginate(
+      octokit.rest.issues.listCommentsForRepo,
+      { ...repoCredentials, per_page: 100 },
+    );
 
-    if (response && response.data) {
-      response.data.forEach((comment) => {
-        const { channelId, id } = getDiscordInfoFromGithubBody(comment.body!);
-        if (!channelId || !id) return;
+    for (const comment of comments) {
+      const { channelId, id } = getDiscordInfoFromGithubBody(comment.body);
+      if (!channelId || !id) continue;
 
-        const thread = store.threads.find((i) => i.id === channelId);
-        thread?.comments.push({ id, git_id: comment.id });
-      });
-    } else {
-      error("Failed to load comments - No response data");
+      const thread = threads.find((i) => i.id === channelId);
+      thread?.comments.push({ id, git_id: comment.id });
     }
   } catch (err) {
     if (err instanceof Error) {
