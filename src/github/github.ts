@@ -28,8 +28,13 @@ import {
 } from "./githubHandlers";
 
 const app = express();
-// Use raw body so we can verify the webhook signature before parsing
-app.use(express.json());
+// Keep the raw bytes GitHub sent: the HMAC must be computed over the exact
+// payload, not over a re-serialization of a parsed object. The body is parsed
+// manually in the webhook route once the signature checks out.
+// Limit is well above real GitHub deliveries while bounding how much an
+// unauthenticated caller can make us buffer (the signature can only be checked
+// after the whole body is read).
+app.use(express.raw({ type: "application/json", limit: "5mb" }));
 
 // Deduplication cache for GitHub webhook deliveries.
 // Prevents processing the same event twice when GitHub retries or sends duplicates.
@@ -59,7 +64,7 @@ function isDuplicateDelivery(deliveryId: string | undefined): boolean {
 }
 
 function verifySignature(
-  payload: string,
+  payload: Buffer,
   signature: string | undefined,
 ): boolean {
   if (!signature) return false;
@@ -69,7 +74,13 @@ function verifySignature(
       .createHmac("sha256", config.GITHUB_WEBHOOK_SECRET)
       .update(payload)
       .digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+
+  const received = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  // timingSafeEqual throws RangeError unless both buffers are the same length,
+  // so a malformed header must be rejected before the comparison.
+  if (received.length !== expectedBuffer.length) return false;
+  return crypto.timingSafeEqual(received, expectedBuffer);
 }
 
 export function initGithub() {
@@ -105,10 +116,17 @@ export function initGithub() {
 
   app.post("/", async (req, res) => {
     const signature = req.headers["x-hub-signature-256"] as string | undefined;
-    const payload = JSON.stringify(req.body);
+    const rawBody = req.body;
 
-    if (!verifySignature(payload, signature)) {
+    if (!Buffer.isBuffer(rawBody) || !verifySignature(rawBody, signature)) {
       res.status(401).json({ msg: "invalid signature" });
+      return;
+    }
+
+    try {
+      req.body = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      res.status(400).json({ msg: "invalid json" });
       return;
     }
 
