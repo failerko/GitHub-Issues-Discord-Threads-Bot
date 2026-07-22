@@ -574,27 +574,69 @@ export async function removeTagFromThread(node_id: string, tagId: string) {
   }
 }
 
+/**
+ * Discord rejects setAvailableTags with "Tag names must be unique" and compares
+ * names case-insensitively, while every lookup here matches exactly. A forum tag
+ * that differs from a project column only in case ("In Progress" vs
+ * "In progress"), or two column names that collide once truncated to Discord's
+ * 20-character limit, would otherwise be appended as a duplicate and fail the
+ * whole batch. Keeps the first occurrence, which is always the existing tag, so
+ * tag IDs and the threads referencing them survive.
+ */
+function dedupeTagsByName<T extends { name: string }>(tags: T[]): T[] {
+  const kept = new Map<string, T>();
+  const dropped: string[] = [];
+
+  for (const tag of tags) {
+    const key = tag.name.toLowerCase();
+    if (kept.has(key)) {
+      dropped.push(`"${tag.name}" (collides with "${kept.get(key)!.name}")`);
+      continue;
+    }
+    kept.set(key, tag);
+  }
+
+  if (dropped.length > 0) {
+    logger.warn(`Tags: Skipped duplicate tag name(s): ${dropped.join(", ")}`);
+  }
+  return [...kept.values()];
+}
+
+/** Case-insensitive tag lookup, matching how Discord enforces name uniqueness. */
+function findTagByName<T extends { name: string }>(
+  tags: T[],
+  name: string,
+): T | undefined {
+  return tags.find((t) => t.name.toLowerCase() === name.toLowerCase());
+}
+
 export async function resetOpinionatedTags() {
   const forum = (await client.channels.fetch(
     config.DISCORD_CHANNEL_ID,
   )) as ForumChannel;
 
   const existingTags = forum.availableTags;
-  const existingByName = new Map(existingTags.map((t) => [t.name, t]));
+  const existingByName = new Map(
+    existingTags.map((t) => [t.name.toLowerCase(), t]),
+  );
 
   // Keep existing tags that match opinionated names (preserves IDs + thread references),
   // add missing ones, and keep any non-opinionated tags (e.g. kanban columns)
-  const opinionatedNames = new Set(OPINIONATED_TAGS.map((t) => t.name));
-  const mergedTags = [
+  const opinionatedNames = new Set(
+    OPINIONATED_TAGS.map((t) => t.name.toLowerCase()),
+  );
+  const mergedTags = dedupeTagsByName([
     // Existing tags that match opinionated names (preserve their Discord IDs)
-    ...existingTags.filter((t) => opinionatedNames.has(t.name)),
+    ...existingTags.filter((t) => opinionatedNames.has(t.name.toLowerCase())),
     // New opinionated tags that don't exist yet
-    ...OPINIONATED_TAGS.filter((t) => !existingByName.has(t.name)),
+    ...OPINIONATED_TAGS.filter((t) => !existingByName.has(t.name.toLowerCase())),
     // Non-opinionated existing tags (kanban columns, etc.)
-    ...existingTags.filter((t) => !opinionatedNames.has(t.name)),
-  ];
+    ...existingTags.filter((t) => !opinionatedNames.has(t.name.toLowerCase())),
+  ]);
 
-  const added = OPINIONATED_TAGS.filter((t) => !existingByName.has(t.name));
+  const added = OPINIONATED_TAGS.filter(
+    (t) => !existingByName.has(t.name.toLowerCase()),
+  );
   if (added.length > 0) {
     await forum.setAvailableTags(mergedTags);
   }
@@ -605,7 +647,7 @@ export async function resetOpinionatedTags() {
   // Populate tagMap: opinionated tag name -> Discord tag ID
   store.tagMap.clear();
   for (const tag of OPINIONATED_TAGS) {
-    const matchingTag = store.availableTags.find((t) => t.name === tag.name);
+    const matchingTag = findTagByName(store.availableTags, tag.name);
     if (matchingTag) {
       store.tagMap.set(tag.name, matchingTag.id);
     }
@@ -651,7 +693,9 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
   )) as ForumChannel;
   const existingTags = forum.availableTags;
 
-  const existingTagNames = new Set(existingTags.map((t) => t.name));
+  const existingTagNames = new Set(
+    existingTags.map((t) => t.name.toLowerCase()),
+  );
 
   const kanbanSlots = Math.min(columns.length, TAG_BUDGET.kanban);
   const columnsToSync = columns.slice(0, kanbanSlots);
@@ -664,7 +708,7 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
 
   // Filter columns that don't already exist as tags
   const newColumnTags = columnsToSync
-    .filter((col) => !existingTagNames.has(col.name.slice(0, 20)))
+    .filter((col) => !existingTagNames.has(col.name.slice(0, 20).toLowerCase()))
     .map((col) => {
       const truncated = col.name.slice(0, 20);
       if (col.name.length > 20) {
@@ -684,7 +728,8 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
   // Build updated tag list: update existing kanban tags with emoji, add new ones
   const updatedExistingTags = existingTags.map((tag) => {
     const matchingCol = columnsToSync.find(
-      (col) => col.name.slice(0, 20) === tag.name,
+      (col) =>
+        col.name.slice(0, 20).toLowerCase() === tag.name.toLowerCase(),
     );
     if (matchingCol?.color && COLUMN_COLOR_TO_EMOJI[matchingCol.color]) {
       return {
@@ -695,7 +740,10 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
     return tag;
   });
 
-  const allTags = [...updatedExistingTags, ...newColumnTags];
+  const allTags = dedupeTagsByName([
+    ...updatedExistingTags,
+    ...newColumnTags,
+  ]);
 
   // Check total budget
   if (allTags.length > TAG_BUDGET.total) {
@@ -718,7 +766,7 @@ export async function syncKanbanTags(columns: ProjectColumn[]) {
   store.kanbanTagMap.clear();
   for (const col of columnsToSync) {
     const truncated = col.name.slice(0, 20);
-    const matchingTag = store.availableTags.find((t) => t.name === truncated);
+    const matchingTag = findTagByName(store.availableTags, truncated);
     if (matchingTag) {
       store.kanbanTagMap.set(col.name, matchingTag.id);
     }
