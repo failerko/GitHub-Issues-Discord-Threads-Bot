@@ -492,6 +492,17 @@ export async function handleProjectItemEdited(req: Request) {
   // Guard: kanban disabled (no project detected at startup)
   if (!store.projectId) return;
 
+  // Guard: the repository may have several projects linked, and all of them
+  // deliver projects_v2_item events. Only the project we synced tags from may
+  // drive tag changes and archiving.
+  const eventProjectId = req.body.projects_v2_item?.project_node_id;
+  if (eventProjectId !== store.projectId) {
+    logger.info(
+      `Kanban: Ignoring item from project ${eventProjectId ?? "(unknown)"}, synced project is ${store.projectId}`,
+    );
+    return;
+  }
+
   // Guard: must be a field_value change (not a body edit)
   const changes = req.body.changes;
   if (!changes?.field_value) return;

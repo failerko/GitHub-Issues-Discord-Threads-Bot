@@ -29,15 +29,25 @@ if (missing.length > 0) {
 
 const env = process.env as Record<(typeof REQUIRED_ENV_VARS)[number], string>;
 
-function toNumber(
-  name: "GITHUB_APP_ID" | "GITHUB_APP_INSTALLATION_ID",
-): number {
-  const value = Number(env[name]);
+function parsePositiveInt(name: string, raw: string): number {
+  const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer, got: "${env[name]}"`);
+    throw new Error(`${name} must be a positive integer, got: "${raw}"`);
   }
   return value;
 }
+
+function toNumber(
+  name: "GITHUB_APP_ID" | "GITHUB_APP_INSTALLATION_ID",
+): number {
+  return parsePositiveInt(name, env[name]);
+}
+
+// Optional: pin kanban sync to a specific GitHub Project by its number (the
+// trailing number in the project URL). When unset, the first linked project
+// that has a Status field is used, which is ambiguous once a repository has
+// more than one project linked to it.
+const projectNumber = process.env.GITHUB_PROJECT_NUMBER;
 
 // The private key is stored base64-encoded. Decoding a raw PEM instead of its
 // base64 form yields garbage that only fails much later, on the first API call.
@@ -64,4 +74,7 @@ export const config = {
   GITHUB_WEBHOOK_SECRET: env.GITHUB_WEBHOOK_SECRET,
   DISCORD_CHANNEL_ID: env.DISCORD_CHANNEL_ID,
   DISCORD_GUILD_ID: env.DISCORD_GUILD_ID,
+  GITHUB_PROJECT_NUMBER: projectNumber
+    ? parsePositiveInt("GITHUB_PROJECT_NUMBER", projectNumber)
+    : undefined,
 };

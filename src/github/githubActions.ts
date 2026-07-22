@@ -552,6 +552,21 @@ export async function clearIssueType(thread: Thread) {
   }
 }
 
+/** Shape of the projectsV2 nodes returned by the discovery query below. */
+interface ProjectV2Node {
+  id: string;
+  title: string;
+  number: number;
+  closed?: boolean;
+  fields?: {
+    nodes?: {
+      id?: string;
+      name?: string;
+      options?: { id: string; name: string; color?: string }[];
+    }[];
+  };
+}
+
 export async function discoverProject(): Promise<{
   projectId: string;
   projectTitle: string;
@@ -562,12 +577,13 @@ export async function discoverProject(): Promise<{
     const result: any = await octokit.graphql(
       `query($owner: String!, $repo: String!) {
         repository(owner: $owner, name: $repo) {
-          projectsV2(first: 1) {
+          projectsV2(first: 20) {
             nodes {
               id
               title
               number
-              fields(first: 20) {
+              closed
+              fields(first: 50) {
                 nodes {
                   ... on ProjectV2SingleSelectField {
                     id
@@ -590,36 +606,68 @@ export async function discoverProject(): Promise<{
       },
     );
 
-    const project = result.repository?.projectsV2?.nodes?.[0];
-    if (!project) {
+    const nodes: ProjectV2Node[] = result.repository?.projectsV2?.nodes ?? [];
+    if (nodes.length === 0) {
       logger.warn(
         "Kanban: No GitHub Project found for repository. Kanban sync disabled.",
       );
       return null;
     }
 
-    const { id: projectId, title, number: projectNumber, fields } = project;
+    const hasStatusField = (p: ProjectV2Node) =>
+      p?.fields?.nodes?.some(
+        (f) => f?.name?.toLowerCase() === "status" && f.options,
+      );
 
-    const statusField = fields.nodes.find(
-      (f: any) => f.name?.toLowerCase() === "status" && f.options,
+    // Selecting by number is the only stable option: the API returns linked
+    // projects in a server-defined order, so "the first one" is arbitrary as
+    // soon as a repository has more than one project.
+    const pinned = config.GITHUB_PROJECT_NUMBER;
+    const project = pinned
+      ? nodes.find((p) => p?.number === pinned)
+      : nodes.find((p) => !p?.closed && hasStatusField(p));
+
+    if (!project) {
+      const available = nodes
+        .map((p) => `#${p?.number} "${p?.title}"`)
+        .join(", ");
+      logger.warn(
+        pinned
+          ? `Kanban: Project #${pinned} is not linked to this repository. Linked projects: ${available}. Kanban sync disabled.`
+          : `Kanban: No open project with a Status field found. Linked projects: ${available}. Kanban sync disabled.`,
+      );
+      return null;
+    }
+
+    if (!pinned && nodes.length > 1) {
+      logger.warn(
+        `Kanban: ${nodes.length} projects are linked to this repository and GITHUB_PROJECT_NUMBER is not set. ` +
+          `Auto-selected #${project.number} "${project.title}"; set GITHUB_PROJECT_NUMBER to pin a specific one.`,
+      );
+    }
+
+    const { id: projectId, title, number: projectNumber } = project;
+
+    const statusField = project.fields?.nodes?.find(
+      (f) => f?.name?.toLowerCase() === "status" && f.options,
     );
-    if (!statusField) {
+    // A non-single-select field comes back as {} from the inline fragment, so
+    // id and options are only guaranteed once the Status field is identified.
+    if (!statusField?.id || !statusField.options) {
       logger.warn(
         "Kanban: No Status field found in project. Kanban sync disabled.",
       );
       return null;
     }
 
-    const columns: ProjectColumn[] = statusField.options.map(
-      (opt: { id: string; name: string; color?: string }) => ({
-        id: opt.id,
-        name: opt.name,
-        ...(opt.color && { color: opt.color }),
-      }),
-    );
+    const columns: ProjectColumn[] = statusField.options.map((opt) => ({
+      id: opt.id,
+      name: opt.name,
+      ...(opt.color && { color: opt.color }),
+    }));
 
     logger.info(
-      `Kanban: Auto-detected project "${title}" (#${projectNumber}) with ${columns.length} status columns`,
+      `Kanban: Using project "${title}" (#${projectNumber}) with ${columns.length} status columns`,
     );
 
     return {
