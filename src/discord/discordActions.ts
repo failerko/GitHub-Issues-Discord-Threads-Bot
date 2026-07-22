@@ -38,6 +38,22 @@ export function isMilestoneLabel(name: string): boolean {
   return MILESTONE_LABEL_PATTERN.test(name);
 }
 
+// The board's intake column. GitHub's project workflow already defaults new
+// issues here, so it doubles as the "untriaged" marker that the old
+// "Needs Triage" label used to provide.
+const INTAKE_COLUMN = "unsorted";
+
+/**
+ * Tag applied when nothing else resolved, so a thread is never created with an
+ * empty tag list (forums can be configured to require one).
+ */
+export function fallbackTagId(): string | undefined {
+  for (const [name, id] of store.kanbanTagMap.entries()) {
+    if (name.toLowerCase() === INTAKE_COLUMN) return id;
+  }
+  return undefined;
+}
+
 interface OpinionatedTag {
   name: string;
   moderated?: boolean;
@@ -847,19 +863,38 @@ export async function pruneOrphanTags() {
   )) as ForumChannel;
 
   const orphans = forum.availableTags.filter((t) => !known.has(t.id));
-  if (orphans.length === 0) {
+
+  // Everything except the issue-type tags is a triage or board decision, so
+  // only moderators may apply it. Bug/Feature/Task stay open so a reporter can
+  // classify their own thread when they create it.
+  const kept = forum.availableTags
+    .filter((t) => known.has(t.id))
+    .map((t) => ({ ...t, moderated: !TYPE_TAG_NAMES.has(t.name) }));
+
+  const moderationChanged = kept.some((t) => {
+    const current = forum.availableTags.find((x) => x.id === t.id);
+    return current && current.moderated !== t.moderated;
+  });
+
+  if (orphans.length === 0 && !moderationChanged) {
     logger.info(
-      `Tag prune: forum matches GitHub, ${forum.availableTags.length} tag(s), nothing to remove`,
+      `Tag prune: forum matches GitHub, ${forum.availableTags.length} tag(s), nothing to change`,
     );
     return;
   }
 
-  const kept = forum.availableTags.filter((t) => known.has(t.id));
-  logger.warn(
-    `Tag prune: removing ${orphans.length} tag(s) with no GitHub source: ${orphans
-      .map((t) => `"${t.name}"`)
-      .join(", ")}. They will also be removed from any thread using them.`,
-  );
+  if (orphans.length > 0) {
+    logger.warn(
+      `Tag prune: removing ${orphans.length} tag(s) with no GitHub source: ${orphans
+        .map((t) => `"${t.name}"`)
+        .join(", ")}. They will also be removed from any thread using them.`,
+    );
+  }
+  if (moderationChanged) {
+    logger.info(
+      `Tag prune: updating moderation flags (${kept.filter((t) => t.moderated).length} moderator-only, ${kept.filter((t) => !t.moderated).length} open)`,
+    );
+  }
 
   await forum.setAvailableTags(kept);
   const refreshed = await forum.fetch();

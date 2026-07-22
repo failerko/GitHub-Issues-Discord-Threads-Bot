@@ -5,6 +5,7 @@ import {
   createComment,
   createThread,
   deleteThread,
+  fallbackTagId,
   getThreadChannel,
   lockThread,
   removeTagFromThread,
@@ -58,9 +59,9 @@ export async function handleOpened(req: Request) {
 
   // Ensure at least one tag -- Discord forums may require a tag to create a post
   if (appliedTags.length === 0) {
-    const fallbackTagId = store.tagMap.get("Needs Triage");
-    if (fallbackTagId) {
-      appliedTags.push(fallbackTagId);
+    const fallback = fallbackTagId();
+    if (fallback) {
+      appliedTags.push(fallback);
     }
   }
 
@@ -525,6 +526,17 @@ export async function handleProjectItemEdited(req: Request) {
 
   // Guard: Status was cleared (moved to no column)
   if (!newColumnName) return;
+
+  // Echo suppression: this change originated from a Discord tag edit, which
+  // already applied the tag locally. Re-applying it would be harmless but the
+  // resulting ThreadUpdate would look like a fresh edit and push back again.
+  const originThread = store.threads.find(
+    (t) => t.node_id === contentNodeId,
+  );
+  if (originThread?.lockBoard) {
+    originThread.lockBoard = false;
+    return;
+  }
 
   logger.info(
     `${field_name}: Issue moved from "${oldColumnName || "(none)"}" to "${newColumnName}"`,

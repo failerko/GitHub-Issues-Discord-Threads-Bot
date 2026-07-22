@@ -14,6 +14,7 @@ interface Thread {
   lockLocking?: boolean;
   lockTagging?: boolean;
   lockLabeling?: boolean;
+  lockBoard?: boolean;
 }
 
 interface ThreadComment {

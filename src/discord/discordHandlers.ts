@@ -11,6 +11,8 @@ import {
 } from "discord.js";
 import { config } from "../config";
 import {
+  addLabelsToIssue,
+  clearIssueType,
   closeIssue,
   createIssue,
   createIssueComment,
@@ -21,6 +23,9 @@ import {
   getIssues,
   lockIssue,
   openIssue,
+  removeLabelFromIssue,
+  setIssueType,
+  setProjectField,
   unlockIssue,
 } from "../github/githubActions";
 import { logger } from "../logger";
@@ -33,6 +38,7 @@ import {
   pruneOrphanTags,
   resetOpinionatedTags,
   enrichThreadAfterIssueCreation,
+  TYPE_TAG_NAMES,
 } from "./discordActions";
 import {
   registerCommands,
@@ -184,6 +190,106 @@ export async function handleChannelUpdate(
 }
 
 
+function arraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((val, idx) => val === b[idx]);
+}
+
+/** Reverse-lookup a tag id to its name in the given map. */
+function nameForTag(
+  map: Map<string, string>,
+  tagId: string,
+): string | undefined {
+  for (const [name, id] of map.entries()) {
+    if (id === tagId) return name;
+  }
+  return undefined;
+}
+
+/**
+ * Mirror a Discord tag edit back to GitHub. Which map a tag belongs to decides
+ * where it is written: tagMap holds labels and issue types, while the board
+ * maps hold Status and Priority, which are single-select fields on the project.
+ */
+async function pushTagChangesToGithub(
+  thread: Thread,
+  oldTags: string[],
+  currentTags: string[],
+) {
+  const added = currentTags.filter((t) => !oldTags.includes(t));
+  const removed = oldTags.filter((t) => !currentTags.includes(t));
+
+  // --- Board fields: only the added tag matters, since each field is
+  // single-select and updateKanbanTag already replaces rather than accumulates.
+  for (const [map, fieldId, columns, field] of [
+    [store.kanbanTagMap, store.statusFieldId, store.kanbanColumns, "Status"],
+    [
+      store.priorityTagMap,
+      store.priorityFieldId,
+      store.priorityColumns,
+      "Priority",
+    ],
+  ] as const) {
+    if (!fieldId) continue;
+    const addedName = added
+      .map((id) => nameForTag(map, id))
+      .find((n): n is string => n !== undefined);
+    if (!addedName || !thread.node_id) continue;
+
+    const option = columns.find((c) => c.name === addedName);
+    if (!option) continue;
+
+    thread.lockBoard = true;
+    const ok = await setProjectField(thread.node_id, fieldId, option.id);
+    if (ok) {
+      logger.info(`${field}: set to "${addedName}" from Discord`);
+    } else {
+      thread.lockBoard = false;
+    }
+  }
+
+  // --- Labels and issue types
+  const addedNames = added
+    .map((id) => nameForTag(store.tagMap, id))
+    .filter((n): n is string => n !== undefined);
+  const removedNames = removed
+    .map((id) => nameForTag(store.tagMap, id))
+    .filter((n): n is string => n !== undefined);
+
+  const addedTypes = addedNames.filter((n) => TYPE_TAG_NAMES.has(n));
+  const addedLabels = addedNames.filter((n) => !TYPE_TAG_NAMES.has(n));
+  const removedTypes = removedNames.filter((n) => TYPE_TAG_NAMES.has(n));
+  const removedLabels = removedNames.filter((n) => !TYPE_TAG_NAMES.has(n));
+
+  if (addedLabels.length > 0) {
+    thread.lockLabeling = true;
+    await addLabelsToIssue(thread, addedLabels);
+  }
+  if (removedLabels.length > 0) {
+    thread.lockLabeling = true;
+    for (const label of removedLabels) {
+      await removeLabelFromIssue(thread, label);
+    }
+  }
+
+  for (const typeName of addedTypes) {
+    thread.lockLabeling = true;
+    await setIssueType(thread, typeName);
+  }
+  // Switching type means adding the new tag before removing the old, so only
+  // clear the GitHub type when no type tag remains on the thread at all.
+  if (removedTypes.length > 0 && addedTypes.length === 0) {
+    const hasRemainingType = currentTags.some((tagId) => {
+      const name = nameForTag(store.tagMap, tagId);
+      return name !== undefined && TYPE_TAG_NAMES.has(name);
+    });
+    if (!hasRemainingType) {
+      thread.lockLabeling = true;
+      await clearIssueType(thread);
+    }
+  }
+}
+
 export async function handleThreadUpdate(
   oldThread: AnyThreadChannel,
   newThread: AnyThreadChannel,
@@ -195,15 +301,17 @@ export async function handleThreadUpdate(
   if (!thread) return;
 
   // --- Tag change detection ---
-  // Tags mirror GitHub one-way (labels, issue type, Status, Priority), so a tag
-  // edited in Discord is recorded locally and deliberately not pushed back.
-  // Without this the mirror would fight the user: GitHub re-asserts its own
-  // state on the next event and any Discord-side edit is overwritten anyway.
+  const oldTags = thread.appliedTags;
   const currentTags = [...newThread.appliedTags];
-  thread.appliedTags = currentTags;
+
+  if (!thread.lockTagging && !arraysEqual(oldTags, currentTags)) {
+    thread.appliedTags = currentTags;
+    await pushTagChangesToGithub(thread, oldTags, currentTags);
+  }
 
   if (thread.lockTagging) {
     thread.lockTagging = false;
+    thread.appliedTags = currentTags;
   }
 
   if (thread.locked !== locked && !thread.lockLocking) {

@@ -24,6 +24,7 @@ import {
   createComment,
   createThread,
   enrichThreadAfterIssueCreation,
+  fallbackTagId,
   lockThread,
 } from "./discordActions";
 import client from "./discord";
@@ -111,9 +112,9 @@ function resolveAppliedTags(
   }
 
   if (appliedTags.length === 0) {
-    const fallbackTagId = store.tagMap.get("Needs Triage");
-    if (fallbackTagId) {
-      appliedTags.push(fallbackTagId);
+    const fallback = fallbackTagId();
+    if (fallback) {
+      appliedTags.push(fallback);
     }
   }
 
@@ -390,10 +391,10 @@ async function syncExternalThread(
     firstMessage.author.displayName ||
     firstMessage.author.username;
 
-  // Forum requires at least one tag — use "Needs Triage" fallback
+  // Forums can require at least one tag — fall back to the intake column
   const appliedTags: string[] = [];
-  const fallbackTagId = store.tagMap.get("Needs Triage");
-  if (fallbackTagId) appliedTags.push(fallbackTagId);
+  const fallback = fallbackTagId();
+  if (fallback) appliedTags.push(fallback);
 
   const forumThread = await forum.threads.create({
     message: {

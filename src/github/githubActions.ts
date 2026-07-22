@@ -570,6 +570,69 @@ interface ProjectV2Node {
   };
 }
 
+/**
+ * Set a single-select field (Status / Priority) on the issue's card in the
+ * synced project. The project *item* id is distinct from the issue node id and
+ * is not stored anywhere, so it is resolved per call.
+ * Returns true when the board was updated.
+ */
+export async function setProjectField(
+  issueNodeId: string,
+  fieldId: string,
+  optionId: string,
+): Promise<boolean> {
+  if (!store.projectId) return false;
+
+  try {
+    const lookup = (await octokit.graphql(
+      `query($issueId: ID!) {
+        node(id: $issueId) {
+          ... on Issue {
+            projectItems(first: 20) { nodes { id project { id } } }
+          }
+        }
+      }`,
+      { issueId: issueNodeId },
+    )) as {
+      node?: { projectItems?: { nodes?: { id: string; project?: { id: string } }[] } };
+    };
+
+    const item = lookup.node?.projectItems?.nodes?.find(
+      (n) => n?.project?.id === store.projectId,
+    );
+
+    if (!item?.id) {
+      logger.warn(
+        "Project write: issue is not on the synced project board, skipping field update",
+      );
+      return false;
+    }
+
+    await octokit.graphql(
+      `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+        updateProjectV2ItemFieldValue(input: {
+          projectId: $projectId,
+          itemId: $itemId,
+          fieldId: $fieldId,
+          value: { singleSelectOptionId: $optionId }
+        }) { projectV2Item { id } }
+      }`,
+      {
+        projectId: store.projectId,
+        itemId: item.id,
+        fieldId,
+        optionId,
+      },
+    );
+    return true;
+  } catch (err) {
+    logger.error(
+      `Project write failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+    );
+    return false;
+  }
+}
+
 export async function discoverProject(): Promise<{
   projectId: string;
   projectTitle: string;
