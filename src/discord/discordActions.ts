@@ -822,6 +822,54 @@ export async function syncColumnTags(
   );
 }
 
+/**
+ * Remove forum tags that no longer correspond to anything on GitHub, so the
+ * forum mirrors the repo exactly. Deleting a tag also strips it from every
+ * thread carrying it, so this must run only after every sync step succeeded —
+ * a failed label sync would otherwise look identical to "all labels deleted".
+ */
+export async function pruneOrphanTags() {
+  const known = new Set<string>([
+    ...store.tagMap.values(),
+    ...store.kanbanTagMap.values(),
+    ...store.priorityTagMap.values(),
+  ]);
+
+  if (known.size === 0) {
+    logger.warn(
+      "Tag prune: no tags are mapped, which means the sync steps produced nothing. Skipping to avoid deleting every tag.",
+    );
+    return;
+  }
+
+  const forum = (await client.channels.fetch(
+    config.DISCORD_CHANNEL_ID,
+  )) as ForumChannel;
+
+  const orphans = forum.availableTags.filter((t) => !known.has(t.id));
+  if (orphans.length === 0) {
+    logger.info(
+      `Tag prune: forum matches GitHub, ${forum.availableTags.length} tag(s), nothing to remove`,
+    );
+    return;
+  }
+
+  const kept = forum.availableTags.filter((t) => known.has(t.id));
+  logger.warn(
+    `Tag prune: removing ${orphans.length} tag(s) with no GitHub source: ${orphans
+      .map((t) => `"${t.name}"`)
+      .join(", ")}. They will also be removed from any thread using them.`,
+  );
+
+  await forum.setAvailableTags(kept);
+  const refreshed = await forum.fetch();
+  store.availableTags = refreshed.availableTags;
+
+  logger.info(
+    `Tag prune: ${store.availableTags.length}/${TAG_BUDGET.total} tags remain`,
+  );
+}
+
 export function syncKanbanTags(columns: ProjectColumn[]) {
   return syncColumnTags(columns, {
     budget: TAG_BUDGET.status,

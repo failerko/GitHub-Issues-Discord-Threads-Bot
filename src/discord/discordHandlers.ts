@@ -30,6 +30,7 @@ import {
   syncKanbanTags,
   syncPriorityTags,
   syncLabelTags,
+  pruneOrphanTags,
   resetOpinionatedTags,
   enrichThreadAfterIssueCreation,
 } from "./discordActions";
@@ -76,9 +77,14 @@ export async function handleClientReady(client: Client) {
   )) as ForumChannel;
   store.availableTags = forumChannel.availableTags;
 
+  // Pruning deletes tags, so it may only run when every source that feeds the
+  // tag maps succeeded. One failed step would make its tags look orphaned.
+  let allTagSyncsSucceeded = true;
+
   try {
     await resetOpinionatedTags();
   } catch (err) {
+    allTagSyncsSucceeded = false;
     logger.error(
       `Tag reset failed during startup: ${err instanceof Error ? err.message : "Unknown error"}`,
     );
@@ -87,6 +93,7 @@ export async function handleClientReady(client: Client) {
   try {
     await syncLabelTags();
   } catch (err) {
+    allTagSyncsSucceeded = false;
     logger.error(
       `Label sync failed during startup: ${err instanceof Error ? err.message : "Unknown error"}`,
     );
@@ -115,8 +122,23 @@ export async function handleClientReady(client: Client) {
       }
     }
   } catch (err) {
+    allTagSyncsSucceeded = false;
     logger.error(
       `Kanban init failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+    );
+  }
+
+  if (allTagSyncsSucceeded) {
+    try {
+      await pruneOrphanTags();
+    } catch (err) {
+      logger.error(
+        `Tag prune failed during startup: ${err instanceof Error ? err.message : "Unknown error"}`,
+      );
+    }
+  } else {
+    logger.warn(
+      "Tag prune: skipped because a tag sync step failed; the forum may hold tags with no GitHub source",
     );
   }
 
